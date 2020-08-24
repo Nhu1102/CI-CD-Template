@@ -1,0 +1,207 @@
+##
+image: docker:17.05
+
+variables:
+  DOCKER_DRIVER: overlay2
+  APP: helloworld
+
+
+stages:
+  - build
+  - package
+  - scan
+  - deploy-aws-fargate
+  - deploy-azure
+  - deploy-tst
+  - review
+  - deploy-prod
+
+sonar_scan:
+  image: maven:latest
+  stage: build
+  script:
+    - mvn -X --batch-mode verify sonar:sonar -DskipTests -Dsonar.host.url=$SONAR_URL -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASS -Dbuild_version=${CI_PIPELINE_ID} -Dsonar.analysis.mode=publish -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME -Dsonar.gitlab.project_id=$CI_PROJECT_ID -Dsonar.gitlab.url="https://gitlab.sophron.io" -Dsonar.gitlab.user_token="GSGZtyn24-vyYvgvnoc-" -Dsonar.host.url="http://sonar.sophron.io" -Dsonar.gitlab.api_version="v4" -Dsonar.branch.name=$CI_COMMIT_REF_NAME 
+  allow_failure: true
+  only:
+    - master
+    
+maven-build:
+  image: maven:latest
+  stage: build
+  script: 
+    - mvn clean install -DskipTests -Dbuild_version=${CI_PIPELINE_ID} 
+  artifacts:
+    paths:
+      - target/HelloWorld-*.jar
+    expire_in: 1 day
+
+docker-build:
+  stage: package
+  script:
+    - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST  
+    - docker build -t $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID} -t $NEXUS_DOCKER_HOST/helloworld:latest --rm .
+    - docker push $NEXUS_DOCKER_HOST/helloworld
+    
+
+sast:
+  image: maven:3.3.9-jdk-8
+  stage: scan
+  tags:
+    - reese
+  script:
+    - mvn --batch-mode verify sonar:sonar -DskipTests -Dsonar.host.url=$SAST_URL -Dsonar.login=$SAST_USER -Dsonar.password=$SAST_PASS -Dbuild_version=${CI_PIPELINE_ID} -Dsonar.analysis.mode=publish -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME -Dsonar.gitlab.project_id=$CI_PROJECT_ID -Dsonar.gitlab.url=$GITLAB_URL -Dsonar.gitlab.user_token=$GITLAB_PAT -Dsonar.host.url=$SONAR_URL -Dsonar.gitlab.api_version="v4" 
+  allow_failure: true
+  only:
+    - master
+
+sonar_vuln:
+    image: bioperl/bioperl
+    stage: scan
+    script:
+      - perl ./smoke_test/sonar_check.pl 'http://osonar/api/issues/search?project=HelloWorld&types=VULNERABILITY'
+    only:
+      - master
+      
+container_scanning:
+  image: docker:stable
+  stage: scan
+  script:
+    - apk add --no-cache git
+    - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST  
+    - docker pull $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID}
+    - wget https://github.com/knqyf263/trivy/releases/download/v0.0.13/trivy_0.0.13_Linux-64bit.tar.gz
+    - tar zxvf trivy_0.0.13_Linux-64bit.tar.gz
+    - ./trivy --exit-code 0 --severity HIGH --quiet $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID}
+    - ./trivy --exit-code 1 --severity CRITICAL --quiet $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID}
+  allow_failure: false
+
+
+deploy_aws_fargate:
+    stage: deploy-aws-fargate
+    script:
+      - ntpd -q -p time.nist.gov
+      - apk add --no-cache curl jq python py-pip
+      - pip install awscli
+      - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST
+      - docker pull $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID}
+      - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+      - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+      - $(aws ecr get-login --no-include-email --region $AWS_REGION | tr -d '\r')
+      - docker tag $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID} $AWS_DKR_REG:${CI_PIPELINE_ID}
+      - docker push $AWS_DKR_REG:${CI_PIPELINE_ID}
+      - aws ecs register-task-definition --family maven-web-app	 --requires-compatibilities FARGATE --cpu 256 --memory 512 --cli-input-json file://helloworld-task-def.json --region $AWS_REGION
+      - aws ecs update-service --cluster default --service helloworld-service --task-definition maven-web-app --region $AWS_REGION
+
+    environment:
+      name: lab_aws_fargate
+      url: $AWS_APP_URL
+    only:
+      - master
+      
+smoke_aws-fargate:
+    image: bioperl/bioperl
+    stage: deploy-aws-fargate
+    script:
+      - perl ./smoke_test/smoke_test.pl $AWS_APP_URL
+
+
+push_image:
+    tags: 
+      - ronald
+    stage: deploy-azure
+    script:
+      - ntpd -q -p time.nist.gov
+      - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST
+      - docker pull $NEXUS_DOCKER_HOST/helloworld:${CI_PIPELINE_ID}
+      - docker login -u $AZURE_APPID -p $AZURE_PASSWORD $AZURE_DKR_REG
+      - docker tag $NEXUS_DOCKER_HOST/helloworld:latest $AZURE_DKR_REG/helloworld:${CI_PIPELINE_ID}
+      - docker push $AZURE_DKR_REG/helloworld:${CI_PIPELINE_ID}
+
+
+deploy_container:
+    tags: 
+      - ronald
+    image: azurecr/azure-cli
+    stage: deploy-azure
+    script:
+      - az login --service-principal -u $AZURE_APPID -p $AZURE_PASSWORD --tenant $AZURE_TENANT
+      - az container create --resource-group Containers --name maven-web-app --image $AZURE_DKR_REG/helloworld:${CI_PIPELINE_ID} --registry-username $AZURE_APPID --registry-password $AZURE_PASSWORD --dns-name-label sophronio-helloworld --ports 8080
+    environment:
+      name: lab_azure
+      url: $AZURE_APP_URL
+    only:
+      - master
+
+smoke_azure:
+    image: bioperl/bioperl
+    stage: deploy-azure
+    script:
+      - perl ./smoke_test/smoke_test.pl $AZURE_APP_URL
+    only:
+      - master
+      
+      
+deploy_tst:
+    image: widerin/openshift-cli
+    stage: deploy-tst
+    script:
+      - cat app.yml | envsubst > app.yml
+      - cat app.yml
+      - oc login $OPENSHIFT_HOST -u $OPENSHIFT_USER -p $OPENSHIFT_PASS --insecure-skip-tls-verify=true
+      - oc project demo-tst
+      - "oc get deployments $APP 2> /dev/null || oc create -f app.yml"
+      - oc replace -f app.yml
+      - "oc get service $APP 2> /dev/null || oc expose deployment/$APP --port=8080"
+      - "oc get routes $APP 2> /dev/null || oc expose service $APP --hostname=hello-tst"
+
+    environment:
+      name: lab_tst
+      url: http://hello-tst/
+    only:
+      - master
+      
+smoke_tst:
+    image: bioperl/bioperl
+    stage: deploy-tst
+    script:
+      - perl ./smoke_test/smoke_test.pl hello-tst
+    only:
+      - master
+      
+email_approver:
+    image: bioperl/bioperl
+    stage: review
+    script:
+      - perl ./smoke_test/email_approv.pl 'rmurphy@sophronnet.com' 'maven_app review/approval needed' 'Please review the maven_app release and approve:<br> <a href="http://osonar/dashboard?id=com.example%3AHelloWorld">SAST</a> <br> <a href="$SONAR_URL/dashboard?id=com.example%3AHelloWorld">Code Quality</a> <br> <a href="$GITLAB_URL/demo/maven-web-app/pipelines/${CI_PIPELINE_ID}">Pipeline</a>'
+    only:
+      - master
+      
+deploy_prod:
+    image: widerin/openshift-cli
+    stage: deploy-prod
+    script:
+      - cat app.yml | envsubst > app.yml
+      - cat app.yml
+      - oc login $OPENSHIFT_HOST -u $OPENSHIFT_USER -p $OPENSHIFT_PASS --insecure-skip-tls-verify=true
+      - oc project demo-prd
+      - "oc get deployments $APP 2> /dev/null || oc create -f app.yml"
+      - oc replace -f app.yml
+      - "oc get service $APP 2> /dev/null || oc expose deployment/$APP --port=8080"
+      - "oc get routes $APP 2> /dev/null || oc expose service $APP --hostname=hello-prod"
+
+    environment:
+      name: lab_prod
+      url: http://hello-prod/
+    only:
+      - master
+    when: manual
+      
+smoke_prod:
+    image: bioperl/bioperl
+    stage: deploy-prod
+    script:
+      - perl ./smoke_test/smoke_test.pl hello-prod
+    only:
+      - master
+
+
