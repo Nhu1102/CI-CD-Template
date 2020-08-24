@@ -1,0 +1,303 @@
+
+image: docker:17.05
+
+variables:
+  DOCKER_DRIVER: overlay2
+  APP: hellocore
+  APPB: helloworld
+
+
+stages:
+  - build
+  - DEV
+  - TEST
+  - scan
+  - review
+  - deploy-aws-fargate
+  - deploy-azure
+  - release-notes
+
+  
+sonar_scan:
+  image: mcr.microsoft.com/dotnet/core/sdk:2.2
+  stage: build
+  allow_failure: true
+  script:
+    - cat /etc/os-release
+    - dotnet tool install --global dotnet-sonarscanner 
+    - dotnet tool install --global coverlet.console
+    - dotnet add package coverlet.msbuild
+    - cd Tests
+    - dotnet add package coverlet.msbuild
+    - cd ..
+    - export PATH="$PATH:/root/.dotnet/tools"
+    - apt-get update
+    - apt-get install default-jre -y
+    - dotnet test Tests/Tests.csproj /p:CollectCoverage=true /p:CoverletOutputFormat=opencover
+    - > 
+        dotnet-sonarscanner
+        begin
+        /key:dotnet_helloworld_docker 
+        /v:"$version.${CI_PIPELINE_ID}"
+        /d:sonar.login="$SONAR_LOGIN"
+        /d:sonar.exclusions="**/wwwroot/**, **/obj/**, **/bin/**" 
+        /d:sonar.cs.opencover.reportsPaths="Tests/coverage.opencover.xml" 
+        /d:sonar.coverage.exclusions="**Test*.cs"
+        /d:sonar.analysis.mode=publish 
+        /d:sonar.gitlab.api_version="v4" 
+        /d:sonar.gitlab.commit_sha="$CI_COMMIT_SHA" 
+        /d:sonar.gitlab.ref_name="$CI_COMMIT_REF_NAME" 
+        /d:sonar.gitlab.project_id="$CI_PROJECT_ID" 
+        /d:sonar.gitlab.url="https://gitlab.sophron.io" 
+        /d:sonar.gitlab.user_token="$SONAR_USER_TOKEN"
+        /d:"sonar.host.url=http://sonar.sophron.io" 
+
+    - dotnet build
+    - dotnet-sonarscanner end /d:sonar.login="$SONAR_LOGIN"
+
+docker-build:
+  stage: build
+  script:
+    - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST  
+    - docker build -t $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID} -t $NEXUS_DOCKER_HOST/$APP:latest --rm .
+    - docker push $NEXUS_DOCKER_HOST/$APP
+
+  
+deploy_dev:
+    image: widerin/openshift-cli
+    stage: DEV
+    script:
+      - cat app.yml | envsubst > app.yml
+      - cat app.yml
+      - oc login $OPENSHIFT_HOST -u $OPENSHIFT_USER -p $OPENSHIFT_PASS --insecure-skip-tls-verify=true
+      - oc project demo-dev
+      - "oc get deployments $APP 2> /dev/null || oc create -f app.yml"
+      - oc replace -f app.yml
+      - "oc get service $APP 2> /dev/null || oc expose deployment/$APP --port=8080"
+      - "oc get routes $APP 2> /dev/null || oc expose service $APP --hostname=$APP-dev"
+    environment:
+      name: lab_dev
+      url: http://$APP-dev/
+    allow_failure: true
+
+smoke_dev:
+    image: bioperl/bioperl
+    stage: DEV
+    script:
+      - perl ./smoke_test/smoke_test.pl $APP-dev
+    allow_failure: true
+    when: delayed
+    start_in: 30 seconds
+
+
+deploy_test:
+    image: widerin/openshift-cli
+    stage: TEST
+    script:
+      - cat app.yml | envsubst > app.yml
+      - cat app.yml
+      - oc login $OPENSHIFT_HOST -u $OPENSHIFT_USER -p $OPENSHIFT_PASS --insecure-skip-tls-verify=true
+      - oc project demo-tst
+      - "oc get deployments $APP 2> /dev/null || oc create -f app.yml"
+      - oc replace -f app.yml
+      - "oc get service $APP 2> /dev/null || oc expose deployment/$APP --port=8080"
+      - "oc get routes $APP 2> /dev/null || oc expose service $APP --hostname=$APP-tst"
+    environment:
+      name: lab_test
+      url: http://$APP-tst/
+    only:
+      - master
+    allow_failure: true
+      
+smoke_test:
+    image: bioperl/bioperl
+    stage: TEST
+    script:
+      - perl ./smoke_test/smoke_test.pl $APP-tst
+    only:
+      - master
+    allow_failure: true
+    when: delayed
+    start_in: 30 seconds
+
+email_approver:
+    image: bioperl/bioperl
+    stage: scan
+    allow_failure: true
+    script:
+      - perl ./smoke_test/email_approv.pl 'rmurphy@sophronnet.com' 'hello_world_docker review/approval needed' 'Please review the maven_app release and approve:<br> <a href="http://sonar.sophron.io/dashboard?id=dotnet_helloworld_docker">Sonar</a> <br> <a href="http://sonar.sophron.io/dashboard?id=dotnet_helloworld_docker">Code Quality</a> <br> <a href="https://gitlab.sophron.io/demo/dotnet_helloworld_docker/pipelines/$CI_PIPELINE_ID">Pipeline</a>'
+    only:
+      - master
+
+container_scanning:
+  image: docker:stable
+  tags:
+    - reese
+  stage: scan
+  script:
+    - apk add --no-cache git
+    - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST  
+    - docker pull $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+    - wget https://github.com/knqyf263/trivy/releases/download/v0.0.13/trivy_0.0.13_Linux-64bit.tar.gz
+    - tar zxvf trivy_0.0.13_Linux-64bit.tar.gz
+    - ./trivy -f json -o results_high.json --exit-code 0 --severity HIGH --quiet $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+    - ./trivy -f json -o results_critical.json --exit-code 0 --severity CRITICAL --quiet $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+    - ./trivy --exit-code 0 --severity HIGH --quiet $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+    - ./trivy --exit-code 0 --severity CRITICAL --quiet $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+  artifacts:
+    paths:
+      - ./results*.json
+    expire_in: 30 days
+
+  allow_failure: true
+  only:
+    - master
+
+# Running Fortify SCA Scan
+fortify_scan:
+  tags:
+    - fortify
+  stage: scan
+  allow_failure: true
+  script:
+    - echo "Running Fortify SCA scan"
+    - echo "Testing again"
+    
+    # Fortify Update
+    #sudo /opt/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/fortifyupdate -url https://update.fortify.com"
+    # Fortify Clean
+    - /home/gitlab-runner/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/sourceanalyzer -Dcom.fortify.sca.ProjectRoot=./.fortify -clean -b $CI_PROJECT_ID
+    # Fortify Translate
+    - /home/gitlab-runner/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/sourceanalyzer -Dcom.fortify.sca.ProjectRoot=./.fortify -b $CI_PROJECT_ID -libdirs **/* **/* 
+    # Fortify Scan
+    - /home/gitlab-runner/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/sourceanalyzer -Dcom.fortify.sca.ProjectRoot=./.fortify -b $CI_PROJECT_ID -scan -f results.fpr
+    # Query FPR file
+    - /home/gitlab-runner/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/FPRUtility -information -categoryIssueCounts -project results.fpr -search -query "[fortify priority order]:critical"
+    # Upload FPR file to SSC server; Create project environment variables for authentication token and project version ID with SSC. 
+    #- /opt/Fortify/Fortify_SCA_and_Apps/bin/fortifyclient -url https://ssc.example.com -authtoken $AUTH_TOKEN uploadFPR -file results.fpr -projectVersionID $PROJ_VER_ID
+    #- /home/gitlab-runner/Fortify/Fortify_SCA_and_Apps_19.1.0/bin/BIRTReportGenerator -template "FISMA Compliance" -source results.fpr -output BirtReport.pdf -format XLS -showSuppressed -UseFortifyPriorityOrder
+  only:
+    - master
+  artifacts:
+    paths:
+      - results.fpr
+dast:
+  stage: scan
+  tags:
+    - ronald
+  image:
+    name: owasp/zap2docker-weekly
+  variables:
+  # URL to scan:
+    DAST_WEBSITE: http://$APP-tst/
+  
+  allow_failure: true
+  script:
+    - mkdir /zap/wrk
+    - zap.sh -cmd -quickurl $DAST_WEBSITE -quickprogress -quickout wrk/zap_report.xml
+    - ls /zap/wrk
+    - pwd
+    - cp /zap/wrk/zap_report.xml /builds/demo/dotnet_helloworld_docker
+    - perl ./smoke_test/defectdojo_submit.pl
+  artifacts:
+    paths:
+      - ./*.xml
+
+      
+Gate:
+    image: bioperl/bioperl
+    stage: review
+    script:
+      - echo wait for manual go 
+    only:
+      - master
+    when: manual  
+    allow_failure: false
+
+deploy_aws_fargate:
+    stage: deploy-aws-fargate
+    script:
+      - ntpd -q -p time.nist.gov
+      - apk add --no-cache curl jq python py-pip
+      - pip install awscli
+      - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST
+      - docker pull $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+      - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+      - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+      - $(aws ecr get-login --no-include-email --region $AWS_REGION | tr -d '\r')
+      - docker tag $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID} 206538721383.dkr.ecr.us-east-1.amazonaws.com/sophronio/$APPB:latest
+      - docker push 206538721383.dkr.ecr.us-east-1.amazonaws.com/sophronio/$APPB:latest
+      - aws ecs register-task-definition --family maven-web-app	 --requires-compatibilities FARGATE --cpu 256 --memory 512 --cli-input-json file://helloworld-task-def.json --region $AWS_REGION
+      - aws ecs update-service --cluster default --service helloworld-service --task-definition maven-web-app --region $AWS_REGION
+
+    environment:
+      name: lab_aws_fargate
+      url: http://ec2co-ecsel-1jwjw4t5k8ijk-1487890701.us-east-1.elb.amazonaws.com:8080/
+    only:
+      - master
+
+        
+smoke_aws-fargate:
+    image: bioperl/bioperl
+    stage: deploy-aws-fargate
+    script:
+      - perl ./smoke_test/smoke_test.pl ec2co-ecsel-1jwjw4t5k8ijk-1487890701.us-east-1.elb.amazonaws.com:8080
+    when: delayed
+    start_in: 30 seconds
+    only:
+      - master
+
+1/2 deploy_azure:
+    tags: 
+      - ronald
+    stage: deploy-azure
+    script:
+      - ntpd -q -p time.nist.gov
+      - docker login -u $NEXUS_USER -p $NEXUS_PASS $NEXUS_DOCKER_HOST
+      - docker pull $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID}
+      - docker login -u $AZURE_APPID -p $AZURE_PASSWORD sophronio.azurecr.io
+      - docker tag $NEXUS_DOCKER_HOST/$APP:${CI_PIPELINE_ID} sophronio.azurecr.io/$APPB:latest
+      - docker push sophronio.azurecr.io/$APPB:latest
+
+
+2/2 deploy_azure:
+    tags: 
+      - ronald
+    image: azurecr/azure-cli
+    stage: deploy-azure
+    script:
+      - az login --service-principal -u $AZURE_APPID -p $AZURE_PASSWORD --tenant $AZURE_TENANT
+      - az container create --resource-group Containers --name maven-web-app --image sophronio.azurecr.io/$APPB:latest --registry-username $AZURE_APPID --registry-password $AZURE_PASSWORD --dns-name-label sophronio-helloworld --ports 8080
+    environment:
+      name: lab_azure
+      url: http://sophronio-helloworld.westus.azurecontainer.io:8080
+    only:
+      - master
+
+smoke_azure:
+    image: bioperl/bioperl
+    stage: deploy-azure
+    script:
+      - perl ./smoke_test/smoke_test.pl sophronio-helloworld.westus.azurecontainer.io:8080
+    only:
+      - master
+    when: delayed
+    start_in: 30 seconds      
+
+create_release:
+    stage: release-notes
+    image: bioperl/bioperl
+    script:
+      - cpan install REST::Client
+      - cpan install JSON
+      - perl create_release.pl $CI_API_V4_URL $CI_PROJECT_ID $CI_MERGE_REQUEST_MILESTONE $CI_PIPELINE_URL $CI_PROJECT_URL
+  #  only:
+  #   - merge_requests
+    only:
+      - master
+    when: manual
+
+      
+
+
+
